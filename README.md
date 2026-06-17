@@ -34,3 +34,5 @@ nano ~/.local/share/nautilus/scripts/VirusTotalGnomeTerminal.sh
 
 [commands](https://www.https://github.com/alphaxleonidas/commands)
 
+[HyperHeadset](https://github.com/alphaxleonidas/HyperHeadset)
+

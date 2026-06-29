@@ -22,8 +22,6 @@ nano ~/.local/share/nautilus/scripts/VirusTotalGnomeTerminal.sh
 
 Adds an option for Open With  using Gnome-terminal in Right Click Context Menu of Nautilus File Manager
 
-# Instructions
-
 ```
 cd ~/.local/share/applications
 ```

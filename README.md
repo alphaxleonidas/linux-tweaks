@@ -18,6 +18,38 @@ chmod -v +x ~/.local/share/nautilus/scripts/VirusTotalGnomeTerminal.sh
 nano ~/.local/share/nautilus/scripts/VirusTotalGnomeTerminal.sh
 ```
 
+# MenuTerminal
+
+Adds an option for Open With  using Gnome-terminal in Right Click Context Menu of Nautilus File Manager
+
+# Instructions
+
+```
+cd ~/.local/share/applications
+```
+
+```
+nano menuterminal.desktop
+```
+
+Add this to the file:
+
+```
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MenuTerminal
+Comment=Open file/folder in GNOME Terminal
+Exec=gnome-terminal --working-directory=%U .
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+MimeType=text/plain;application/x-shellscript;inode/directory;
+NoDisplay=false
+StartupNotify=true
+```
+
+Now the Open With menu in Nautlius contains menuterminal which will open the terminal in that directory.
 
 
 # Other Tweaks (System Wide) - Link to repos

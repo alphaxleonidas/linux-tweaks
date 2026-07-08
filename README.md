@@ -52,6 +52,9 @@ Now the Open With menu in Nautlius contains menuterminal which will open the ter
 
 # Other Tweaks (System Wide) - Link to repos
 
+
+[Commands](https://www.https://github.com/alphaxleonidas/commands)
+
 [GPU-Stats-NVIDIA-GNOME](https://www.github.com/alphaxleonidas/GPU-Stats-NVIDIA-GNOME)
 
 [GPU-Stats-NVIDIA-KDE](https://github.com/alphaxleonidas/GPU-Stats-NVIDIA-KDE)
@@ -62,7 +65,6 @@ Now the Open With menu in Nautlius contains menuterminal which will open the ter
 
 [mpv](https://www.github.com/alphaxleonidas/mpv)
 
-[commands](https://www.https://github.com/alphaxleonidas/commands)
 
 [HyperHeadset](https://github.com/alphaxleonidas/HyperHeadset)
 

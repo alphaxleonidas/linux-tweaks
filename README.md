@@ -53,7 +53,7 @@ Now the Open With menu in Nautlius contains menuterminal which will open the ter
 # Other Tweaks (System Wide) - Link to repos
 
 
-[Commands](https://www.https://github.com/alphaxleonidas/commands)
+[Commands](https://www.github.com/alphaxleonidas/commands)
 
 [GPU-Stats-NVIDIA-GNOME](https://www.github.com/alphaxleonidas/GPU-Stats-NVIDIA-GNOME)
 

@@ -34,7 +34,11 @@ TAB_COUNT=0
 PAUSE_AFTER=20
 UPLOAD_MISSING=false
 MISSING_FILES=()
-REPORT_URLS=()          # Collect all report URLs
+REPORT_URLS=()
+
+# VirusTotal upload limit (650 MB)
+MAX_UPLOAD_BYTES=$((650 * 1024 * 1024))
+DIRECT_UPLOAD_LIMIT=$((32 * 1024 * 1024))
 
 # ----------------------------- Helper Functions --------------------------
 
@@ -99,7 +103,7 @@ uri_to_path() {
 extract_stats() {
     local json_file="$1"
     if command -v jq &>/dev/null; then
-        jq -r '.data.attributes.last_analysis_stats |
+        jq -r '.data.attributes.last_analysis_stats | 
             "malicious: \(.malicious // 0)\nsuspicious: \(.suspicious // 0)\nundetected: \(.undetected // 0)\nharmless: \(.harmless // 0)\ntimeout: \(.timeout // 0)"' "$json_file" 2>/dev/null
     else
         local malicious=$(grep -o '"malicious":[[:space:]]*[0-9]*' "$json_file" 2>/dev/null | grep -o '[0-9]*$' | head -1)
@@ -120,7 +124,21 @@ extract_stats() {
     fi
 }
 
-# Upload a single file to VirusTotal
+# Get file size in bytes (cross-platform)
+get_file_size() {
+    local file="$1"
+    if command -v stat &>/dev/null; then
+        if stat -c '%s' "$file" 2>/dev/null; then
+            return
+        elif stat -f '%z' "$file" 2>/dev/null; then
+            return
+        fi
+    fi
+    # fallback: wc -c
+    wc -c < "$file" 2>/dev/null | tr -d ' '
+}
+
+# Upload a single file to VirusTotal – with 650 MB limit check
 upload_file() {
     local file="$1"
     local sha="$2"
@@ -132,33 +150,87 @@ upload_file() {
         fi
     fi
 
-    echo "   ⬆️  Uploading: $(basename "$file")" >&2
+    # Check file size against 650 MB limit
+    local filesize
+    filesize=$(get_file_size "$file")
+    if [[ -z "$filesize" ]]; then
+        echo "   ⚠️  Could not determine file size for '$file' – skipping." >&2
+        return 1
+    fi
+    if [[ "$filesize" -gt "$MAX_UPLOAD_BYTES" ]]; then
+        local size_mb=$(( filesize / 1024 / 1024 ))
+        echo "   ⚠️  File too large (${size_mb}MB) – VirusTotal limit is 650MB. Skipping upload." >&2
+        return 1
+    fi
+
     local upload_response="/tmp/vt_upload_$$.json"
     local http_code
-    http_code=$(curl -s -o "$upload_response" -w "%{http_code}" \
-        -X POST \
-        -H "x-apikey: $API_KEY" \
-        -F "file=@$file" \
-        "https://www.virustotal.com/api/v3/files")
+    local final_sha="$sha"
 
+    # Decide method based on size (32 MB threshold)
+    if [[ "$filesize" -le "$DIRECT_UPLOAD_LIMIT" ]]; then
+        # ---- Direct upload (≤32 MB) ----
+        echo "   ⬆️  Uploading (direct): $(basename "$file")" >&2
+        http_code=$(curl -s -o "$upload_response" -w "%{http_code}" \
+            -X POST \
+            -H "x-apikey: $API_KEY" \
+            -F "file=@$file" \
+            "https://www.virustotal.com/api/v3/files")
+    else
+        # ---- Two-step upload via upload_url (>32 MB and ≤650 MB) ----
+        echo "   ⬆️  Uploading (large file via upload_url): $(basename "$file")" >&2
+        # Step 1: Request an upload URL
+        local upload_url_response="/tmp/vt_upload_url_$$.json"
+        http_code=$(curl -s -o "$upload_url_response" -w "%{http_code}" \
+            -X GET \
+            -H "x-apikey: $API_KEY" \
+            "https://www.virustotal.com/api/v3/files/upload_url")
+        if [[ "$http_code" -ne 200 ]]; then
+            echo "   ❌ Failed to get upload URL (HTTP $http_code)." >&2
+            rm -f "$upload_url_response"
+            return 1
+        fi
+        # Extract the upload URL from the response
+        local upload_url
+        if command -v jq &>/dev/null; then
+            upload_url=$(jq -r '.data' "$upload_url_response" 2>/dev/null)
+        else
+            upload_url=$(grep -o '"data":"[^"]*"' "$upload_url_response" 2>/dev/null | head -1 | cut -d'"' -f4)
+        fi
+        rm -f "$upload_url_response"
+        if [[ -z "$upload_url" || "$upload_url" == "null" ]]; then
+            echo "   ❌ Could not extract upload URL from response." >&2
+            return 1
+        fi
+
+        # Step 2: PUT the file to the upload URL
+        http_code=$(curl -s -o "$upload_response" -w "%{http_code}" \
+            -X PUT \
+            --upload-file "$file" \
+            "$upload_url")
+    fi
+
+    # Process the upload response
     if [[ "$http_code" -eq 200 ]]; then
+        # Extract the analysis ID (SHA-256) from the response
         local analysis_id
         if command -v jq &>/dev/null; then
             analysis_id=$(jq -r '.data.id' "$upload_response" 2>/dev/null)
         else
             analysis_id=$(grep -o '"id":"[^"]*"' "$upload_response" 2>/dev/null | head -1 | cut -d'"' -f4)
         fi
-        if [[ -n "$analysis_id" ]]; then
-            local url="https://www.virustotal.com/gui/file/$analysis_id"
-            echo "   ✅ Upload successful: $url" >&2
-            echo "   Opening upload result page..." >&2
-            open_url_background "$url"
-            if command -v notify-send &>/dev/null; then
-                notify-send -t 5000 "VirusTotal Upload" "Uploaded: $(basename "$file")" 2>/dev/null
-            fi
-        else
-            echo "   ⚠️  Upload succeeded but could not get analysis ID." >&2
+        if [[ -n "$analysis_id" && "$analysis_id" != "null" ]]; then
+            final_sha="$analysis_id"
         fi
+        local url="https://www.virustotal.com/gui/file/$final_sha"
+        echo "   ✅ Upload successful: $url" >&2
+        echo "   Opening upload result page..." >&2
+        open_url_background "$url"
+        if command -v notify-send &>/dev/null; then
+            notify-send -t 5000 "VirusTotal Upload" "Uploaded: $(basename "$file")" 2>/dev/null
+        fi
+    elif [[ "$http_code" -eq 413 ]]; then
+        echo "   ❌ Upload failed: file too large (413). VirusTotal's limit is 650MB." >&2
     else
         echo "   ❌ Upload failed (HTTP $http_code)." >&2
         cat "$upload_response" >&2 2>/dev/null
@@ -193,10 +265,8 @@ process_file() {
 
     if [[ "$http_code" -eq 200 ]]; then
         report_url="https://www.virustotal.com/gui/file/$sha"
-        # Store URL for later (if needed)
         REPORT_URLS+=("$report_url")
 
-        # Stats first
         echo "   📊 Stats:" >&2
         extract_stats "$TMP_RESPONSE" | sed -e 's/malicious:/☠️ malicious:/' \
                                             -e 's/suspicious:/⚠️ suspicious:/' \
@@ -205,7 +275,6 @@ process_file() {
                                             -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
         echo "   🔗 Report: $report_url" >&2
 
-        # Open browser if enabled
         if [[ "$OPEN_BROWSER" == true ]]; then
             echo "   Opening browser tab in background..." >&2
             open_url_background "$report_url"
@@ -217,7 +286,6 @@ process_file() {
         echo "   📂 Open Folder: file://$dir_path/" >&2
         echo "   📄 File: $base_name" >&2
 
-        # Pause if enabled and we just opened a tab
         if [[ "$OPEN_BROWSER" == true ]] && (( TAB_COUNT % PAUSE_AFTER == 0 )); then
             read -rp "Opened $TAB_COUNT tabs. Continue opening? (Y/n): " cont
             if [[ -z "$cont" ]]; then
@@ -382,27 +450,42 @@ done
 echo "------------------------------------------------------------" >&2
 echo "All files processed." >&2
 
-# Handle missing files (upload if not done on the fly)
+# Handle missing files (upload if not done on the fly) - filter out oversized (>650MB)
 if [[ "$UPLOAD_MISSING" == false ]] && [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
     echo "Found ${#MISSING_FILES[@]} files with no VirusTotal report." >&2
-    read -rp "Do you want to upload these files now? (y/N): " upload_now
-    if [[ "$upload_now" =~ ^[Yy]$ ]]; then
-        read -rp "Are you sure? (y/N): " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            echo "Uploading ${#MISSING_FILES[@]} files..." >&2
-            for f in "${MISSING_FILES[@]}"; do
-                upload_file "$f"
-                echo >&2
-            done
+    # Filter out files larger than 650MB
+    local filtered_files=()
+    for f in "${MISSING_FILES[@]}"; do
+        sz=$(get_file_size "$f")
+        if [[ -n "$sz" ]] && [[ "$sz" -le "$MAX_UPLOAD_BYTES" ]]; then
+            filtered_files+=("$f")
         else
-            echo "Upload cancelled." >&2
+            echo "   ⚠️  Skipping oversized file: $(basename "$f") ( >650MB )" >&2
+        fi
+    done
+    MISSING_FILES=("${filtered_files[@]}")
+    if [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
+        read -rp "Do you want to upload these ${#MISSING_FILES[@]} files now? (y/N): " upload_now
+        if [[ "$upload_now" =~ ^[Yy]$ ]]; then
+            read -rp "Are you sure? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Uploading ${#MISSING_FILES[@]} files..." >&2
+                for f in "${MISSING_FILES[@]}"; do
+                    upload_file "$f"
+                    echo >&2
+                done
+            else
+                echo "Upload cancelled." >&2
+            fi
+        else
+            echo "Upload skipped." >&2
         fi
     else
-        echo "Upload skipped." >&2
+        echo "No uploadable files (all oversized)." >&2
     fi
 fi
 
-# NEW: Offer to open all report links if we didn't open them during scan
+# Offer to open all report links if we didn't open them during scan
 if [[ "$OPEN_BROWSER" == false ]] && [[ ${#REPORT_URLS[@]} -gt 0 ]]; then
     echo "Found ${#REPORT_URLS[@]} report links that were not opened." >&2
     read -rp "Open all report links in the browser now? (y/N): " open_all
@@ -410,7 +493,6 @@ if [[ "$OPEN_BROWSER" == false ]] && [[ ${#REPORT_URLS[@]} -gt 0 ]]; then
         echo "Opening ${#REPORT_URLS[@]} report links in background..." >&2
         for url in "${REPORT_URLS[@]}"; do
             open_url_background "$url"
-            # Small delay to avoid overwhelming the system
             sleep 0.5
         done
         echo "All links opened." >&2

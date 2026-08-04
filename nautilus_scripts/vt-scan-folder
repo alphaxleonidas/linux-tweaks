@@ -1,0 +1,188 @@
+#!/bin/bash
+
+# ----------------------------------------------------------------------
+# Nautilus script: vt-scan
+# Purpose: Scan selected files/folders with VirusTotal, show progress
+#          in a terminal, and open reports in background tabs.
+# Usage:   Right-click on files/folders -> Scripts -> vt-scan
+# ----------------------------------------------------------------------
+
+# ---- If not running in a terminal, re-launch in one ----
+if [[ -z "$VT_SCAN_RUNNING" ]]; then
+    export VT_SCAN_RUNNING=1
+    # Try to find a terminal emulator
+    if command -v gnome-terminal &>/dev/null; then
+        exec gnome-terminal -- bash -c "$0 \"\$@\"; read -p 'Press Enter to close...'" -- "$@"
+    elif command -v konsole &>/dev/null; then
+        exec konsole -e bash -c "$0 \"\$@\"; read -p 'Press Enter to close...'" -- "$@"
+    elif command -v xterm &>/dev/null; then
+        exec xterm -e bash -c "$0 \"\$@\"; read -p 'Press Enter to close...'" -- "$@"
+    else
+        echo "No terminal emulator found. Please run this script in a terminal." >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# ---- Now we are in a terminal ----
+API_KEY_FILE="$HOME/.vt_api_key"
+TMP_RESPONSE="/tmp/vt_response_$$.json"
+trap 'rm -f "$TMP_RESPONSE"' EXIT
+
+# ----------------------------- Helper Functions --------------------------
+
+# Save API key (prompt in terminal)
+save_api_key() {
+    read -rp "Enter your VirusTotal API key: " API_KEY
+    if [[ -z "$API_KEY" ]]; then
+        echo "Error: API key cannot be empty." >&2
+        exit 1
+    fi
+    echo "$API_KEY" > "$API_KEY_FILE"
+    chmod 600 "$API_KEY_FILE"
+    echo "API key saved to $API_KEY_FILE"
+}
+
+# Retrieve API key
+get_api_key() {
+    if [[ "$1" == "--reset-key" ]]; then
+        save_api_key
+        return
+    fi
+
+    if [[ -f "$API_KEY_FILE" ]]; then
+        API_KEY=$(<"$API_KEY_FILE")
+        if [[ -z "$API_KEY" ]]; then
+            echo "Stored API key is empty. Please re-enter." >&2
+            save_api_key
+        fi
+    else
+        echo "No API key found. Please enter one." >&2
+        save_api_key
+    fi
+}
+
+# Open URL in background tab (Linux)
+open_url_background() {
+    local url="$1"
+    if command -v xdotool &>/dev/null; then
+        local current_win
+        current_win=$(xdotool getwindowfocus 2>/dev/null)
+        (xdg-open "$url" &) 2>/dev/null
+        sleep 0.3
+        if [[ -n "$current_win" ]]; then
+            xdotool windowactivate "$current_win" 2>/dev/null
+        fi
+        return
+    fi
+    # Fallback
+    (xdg-open "$url" &) 2>/dev/null
+}
+
+# Convert file:// URI to path
+uri_to_path() {
+    local uri="$1"
+    local path="${uri#file://}"
+    path=$(echo -e "$path" | sed -e 's/%20/ /g')
+    echo "$path"
+}
+
+# Process a single file
+process_file() {
+    local file="$1"
+    local sha
+    sha=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    if [[ -z "$sha" ]]; then
+        echo "⚠️  Could not compute hash for '$file' – skipping." >&2
+        return
+    fi
+
+    echo "➜ Processing: '$file'" >&2
+    echo "   SHA256: $sha" >&2
+
+    http_code=$(curl -s -o "$TMP_RESPONSE" -w "%{http_code}" \
+        -H "x-apikey: $API_KEY" \
+        "https://www.virustotal.com/api/v3/files/$sha")
+
+    if [[ "$http_code" -eq 200 ]]; then
+        report_url="https://www.virustotal.com/gui/file/$sha"
+        echo "   ✅ Report found. Opening browser tab in background..." >&2
+        open_url_background "$report_url"
+    elif [[ "$http_code" -eq 404 ]]; then
+        echo "   ❌ No report found for this hash." >&2
+    elif [[ "$http_code" -eq 429 ]]; then
+        echo "   ⏳ Rate limit exceeded. Waiting 60 seconds then retrying..." >&2
+        sleep 60
+        http_code=$(curl -s -o "$TMP_RESPONSE" -w "%{http_code}" \
+            -H "x-apikey: $API_KEY" \
+            "https://www.virustotal.com/api/v3/files/$sha")
+        if [[ "$http_code" -eq 200 ]]; then
+            report_url="https://www.virustotal.com/gui/file/$sha"
+            echo "   ✅ Report found (after retry). Opening browser tab..." >&2
+            open_url_background "$report_url"
+        else
+            echo "   ❌ Still no report (HTTP $http_code)." >&2
+        fi
+    else
+        echo "   ⚠️  Unexpected HTTP status $http_code – check your API key or network." >&2
+    fi
+
+    # Wait 15 seconds to respect rate limit
+    echo "   Sleeping 15 seconds before next file..." >&2
+    sleep 15
+}
+
+# ----------------------------- Main Script ------------------------------
+
+# Handle --reset-key
+if [[ "$1" == "--reset-key" ]]; then
+    save_api_key
+    exit 0
+fi
+
+# Get API key
+get_api_key
+
+# Determine what to scan
+FILES_TO_SCAN=()
+
+if [[ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]]; then
+    # Selected files/dirs (newline-separated)
+    while IFS= read -r item; do
+        [[ -n "$item" ]] && FILES_TO_SCAN+=("$item")
+    done <<< "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
+elif [[ -n "$NAUTILUS_SCRIPT_CURRENT_URI" ]]; then
+    # No selection, use current folder
+    current_path=$(uri_to_path "$NAUTILUS_SCRIPT_CURRENT_URI")
+    FILES_TO_SCAN+=("$current_path")
+else
+    # Not in Nautilus, use current directory
+    FILES_TO_SCAN+=(".")
+fi
+
+if [[ ${#FILES_TO_SCAN[@]} -eq 0 ]]; then
+    echo "No files or folders to scan." >&2
+    exit 1
+fi
+
+echo "Starting VirusTotal scan..." >&2
+echo "Rate limit: 15 seconds between requests." >&2
+echo "Selected items: ${FILES_TO_SCAN[*]}" >&2
+echo "------------------------------------------------------------" >&2
+
+for item in "${FILES_TO_SCAN[@]}"; do
+    if [[ -d "$item" ]]; then
+        # Recursively scan all files in directory
+        find "$item" -type f -print0 | while IFS= read -r -d '' file; do
+            process_file "$file"
+        done
+    elif [[ -f "$item" ]]; then
+        process_file "$item"
+    else
+        echo "Warning: '$item' is not a regular file or directory." >&2
+    fi
+done
+
+echo "------------------------------------------------------------" >&2
+echo "All files processed." >&2
+read -p "Press Enter to close this window..." </dev/tty

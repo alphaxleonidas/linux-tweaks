@@ -2,15 +2,14 @@
 
 # ----------------------------------------------------------------------
 # Nautilus script: vt-scan
-# Purpose: Scan selected files/folders with VirusTotal, show progress
-#          in a terminal, and open reports in background tabs.
+# Purpose: Scan selected files/folders with VirusTotal, show stats,
+#          and open reports in background tabs.
 # Usage:   Right-click on files/folders -> Scripts -> vt-scan
 # ----------------------------------------------------------------------
 
 # ---- If not running in a terminal, re-launch in one ----
 if [[ -z "$VT_SCAN_RUNNING" ]]; then
     export VT_SCAN_RUNNING=1
-    # Try to find a terminal emulator
     if command -v gnome-terminal &>/dev/null; then
         exec gnome-terminal -- bash -c "$0 \"\$@\"; read -p 'Press Enter to close...'" -- "$@"
     elif command -v konsole &>/dev/null; then
@@ -31,7 +30,6 @@ trap 'rm -f "$TMP_RESPONSE"' EXIT
 
 # ----------------------------- Helper Functions --------------------------
 
-# Save API key (prompt in terminal)
 save_api_key() {
     read -rp "Enter your VirusTotal API key: " API_KEY
     if [[ -z "$API_KEY" ]]; then
@@ -43,13 +41,11 @@ save_api_key() {
     echo "API key saved to $API_KEY_FILE"
 }
 
-# Retrieve API key
 get_api_key() {
     if [[ "$1" == "--reset-key" ]]; then
         save_api_key
         return
     fi
-
     if [[ -f "$API_KEY_FILE" ]]; then
         API_KEY=$(<"$API_KEY_FILE")
         if [[ -z "$API_KEY" ]]; then
@@ -75,7 +71,6 @@ open_url_background() {
         fi
         return
     fi
-    # Fallback
     (xdg-open "$url" &) 2>/dev/null
 }
 
@@ -85,6 +80,24 @@ uri_to_path() {
     local path="${uri#file://}"
     path=$(echo -e "$path" | sed -e 's/%20/ /g')
     echo "$path"
+}
+
+# Extract stats from VT JSON and add emojis
+extract_stats() {
+    local json_file="$1"
+    local stats
+    if command -v jq &>/dev/null; then
+        stats=$(jq -r '.data.attributes.last_analysis_stats | 
+            "malicious: \(.malicious // 0)\nsuspicious: \(.suspicious // 0)\nundetected: \(.undetected // 0)\nharmless: \(.harmless // 0)\ntimeout: \(.timeout // 0)"' "$json_file" 2>/dev/null)
+    else
+        stats=$(grep -E '"(malicious|suspicious|undetected|harmless|timeout)"' "$json_file" 2>/dev/null | \
+            awk -F: '{gsub(/[",]/, "", $2); print $1 ": " $2}' | sed 's/^[[:space:]]*//')
+    fi
+    echo "$stats" | sed -e 's/malicious:/☠️ malicious:/' \
+                        -e 's/suspicious:/⚠️ suspicious:/' \
+                        -e 's/undetected:/✅ undetected:/' \
+                        -e 's/harmless:/😇 harmless:/' \
+                        -e 's/timeout:/⏰ timeout:/'
 }
 
 # Process a single file
@@ -97,7 +110,10 @@ process_file() {
         return
     fi
 
-    echo "➜ Processing: '$file'" >&2
+    local abs_path
+    abs_path=$(realpath "$file")
+
+    echo "➜ Processing: $abs_path" >&2
     echo "   SHA256: $sha" >&2
 
     http_code=$(curl -s -o "$TMP_RESPONSE" -w "%{http_code}" \
@@ -106,10 +122,14 @@ process_file() {
 
     if [[ "$http_code" -eq 200 ]]; then
         report_url="https://www.virustotal.com/gui/file/$sha"
-        echo "   ✅ Report found. Opening browser tab in background..." >&2
+        echo "   🔗 Report: $report_url" >&2
+        echo "   📊 Stats:" >&2
+        extract_stats "$TMP_RESPONSE" | sed 's/^/      /' >&2
+        echo "   Opening browser tab in background..." >&2
         open_url_background "$report_url"
     elif [[ "$http_code" -eq 404 ]]; then
         echo "   ❌ No report found for this hash." >&2
+        echo "   💡 Upload this file: https://www.virustotal.com/gui/home/upload" >&2
     elif [[ "$http_code" -eq 429 ]]; then
         echo "   ⏳ Rate limit exceeded. Waiting 60 seconds then retrying..." >&2
         sleep 60
@@ -118,45 +138,41 @@ process_file() {
             "https://www.virustotal.com/api/v3/files/$sha")
         if [[ "$http_code" -eq 200 ]]; then
             report_url="https://www.virustotal.com/gui/file/$sha"
-            echo "   ✅ Report found (after retry). Opening browser tab..." >&2
+            echo "   🔗 Report: $report_url" >&2
+            echo "   📊 Stats:" >&2
+            extract_stats "$TMP_RESPONSE" | sed 's/^/      /' >&2
+            echo "   Opening browser tab..." >&2
             open_url_background "$report_url"
         else
             echo "   ❌ Still no report (HTTP $http_code)." >&2
+            echo "   💡 Upload this file: https://www.virustotal.com/gui/home/upload" >&2
         fi
     else
         echo "   ⚠️  Unexpected HTTP status $http_code – check your API key or network." >&2
     fi
-
-    # Wait 15 seconds to respect rate limit
-    echo "   Sleeping 15 seconds before next file..." >&2
-    sleep 15
 }
 
 # ----------------------------- Main Script ------------------------------
 
-# Handle --reset-key
 if [[ "$1" == "--reset-key" ]]; then
     save_api_key
     exit 0
 fi
 
-# Get API key
 get_api_key
 
-# Determine what to scan
+# Gather files
 FILES_TO_SCAN=()
+ALL_FILES=()
 
 if [[ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]]; then
-    # Selected files/dirs (newline-separated)
     while IFS= read -r item; do
         [[ -n "$item" ]] && FILES_TO_SCAN+=("$item")
     done <<< "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
 elif [[ -n "$NAUTILUS_SCRIPT_CURRENT_URI" ]]; then
-    # No selection, use current folder
     current_path=$(uri_to_path "$NAUTILUS_SCRIPT_CURRENT_URI")
     FILES_TO_SCAN+=("$current_path")
 else
-    # Not in Nautilus, use current directory
     FILES_TO_SCAN+=(".")
 fi
 
@@ -165,22 +181,42 @@ if [[ ${#FILES_TO_SCAN[@]} -eq 0 ]]; then
     exit 1
 fi
 
-echo "Starting VirusTotal scan..." >&2
-echo "Rate limit: 15 seconds between requests." >&2
-echo "Selected items: ${FILES_TO_SCAN[*]}" >&2
-echo "------------------------------------------------------------" >&2
-
+echo "Collecting files..." >&2
 for item in "${FILES_TO_SCAN[@]}"; do
     if [[ -d "$item" ]]; then
-        # Recursively scan all files in directory
-        find "$item" -type f -print0 | while IFS= read -r -d '' file; do
-            process_file "$file"
-        done
+        while IFS= read -r -d '' file; do
+            ALL_FILES+=("$file")
+        done < <(find "$item" -type f -print0 2>/dev/null)
     elif [[ -f "$item" ]]; then
-        process_file "$item"
+        ALL_FILES+=("$item")
     else
         echo "Warning: '$item' is not a regular file or directory." >&2
     fi
+done
+
+total_files=${#ALL_FILES[@]}
+if [[ $total_files -eq 0 ]]; then
+    echo "No regular files found to scan." >&2
+    exit 1
+fi
+
+echo "Found $total_files files to scan." >&2
+read -rp "Do you want to proceed? (Y/n): " answer
+if [[ -z "$answer" ]]; then
+    answer="y"
+fi
+if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    echo "Aborted." >&2
+    exit 0
+fi
+
+echo "Starting VirusTotal scan..." >&2
+echo "Rate limit: 15 seconds between requests." >&2
+echo "------------------------------------------------------------" >&2
+
+for file in "${ALL_FILES[@]}"; do
+    process_file "$file"
+    echo >&2   # blank line between files
 done
 
 echo "------------------------------------------------------------" >&2

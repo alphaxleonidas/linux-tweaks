@@ -58,15 +58,20 @@ get_api_key() {
     fi
 }
 
-# Open URL in background tab (Linux)
+# Open URL in background tab (Linux) – improved focus handling
 open_url_background() {
     local url="$1"
     if command -v xdotool &>/dev/null; then
         local current_win
         current_win=$(xdotool getwindowfocus 2>/dev/null)
+        if [[ -z "$current_win" ]]; then
+            current_win=$(xdotool getactivewindow 2>/dev/null)
+        fi
         (xdg-open "$url" &) 2>/dev/null
-        sleep 0.3
+        sleep 1
         if [[ -n "$current_win" ]]; then
+            xdotool windowactivate "$current_win" 2>/dev/null
+            sleep 0.2
             xdotool windowactivate "$current_win" 2>/dev/null
         fi
         return
@@ -112,6 +117,10 @@ process_file() {
 
     local abs_path
     abs_path=$(realpath "$file")
+    local dir_path
+    dir_path=$(dirname "$abs_path")
+    local base_name
+    base_name=$(basename "$abs_path")
 
     echo "➜ Processing: $abs_path" >&2
     echo "   SHA256: $sha" >&2
@@ -123,13 +132,17 @@ process_file() {
     if [[ "$http_code" -eq 200 ]]; then
         report_url="https://www.virustotal.com/gui/file/$sha"
         echo "   🔗 Report: $report_url" >&2
-        echo "   📊 Stats:" >&2
-        extract_stats "$TMP_RESPONSE" | sed 's/^/      /' >&2
         echo "   Opening browser tab in background..." >&2
         open_url_background "$report_url"
+        echo "   📊 Stats:" >&2
+        extract_stats "$TMP_RESPONSE" | sed 's/^/      /' >&2
+        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📄 File: $base_name" >&2
     elif [[ "$http_code" -eq 404 ]]; then
         echo "   ❌ No report found for this hash." >&2
         echo "   💡 Upload this file: https://www.virustotal.com/gui/home/upload" >&2
+        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📄 File: $base_name" >&2
     elif [[ "$http_code" -eq 429 ]]; then
         echo "   ⏳ Rate limit exceeded. Waiting 60 seconds then retrying..." >&2
         sleep 60
@@ -139,16 +152,22 @@ process_file() {
         if [[ "$http_code" -eq 200 ]]; then
             report_url="https://www.virustotal.com/gui/file/$sha"
             echo "   🔗 Report: $report_url" >&2
-            echo "   📊 Stats:" >&2
-            extract_stats "$TMP_RESPONSE" | sed 's/^/      /' >&2
             echo "   Opening browser tab..." >&2
             open_url_background "$report_url"
+            echo "   📊 Stats:" >&2
+            extract_stats "$TMP_RESPONSE" | sed 's/^/      /' >&2
+            echo "   📂 Open Folder: file://$dir_path/" >&2
+            echo "   📄 File: $base_name" >&2
         else
             echo "   ❌ Still no report (HTTP $http_code)." >&2
             echo "   💡 Upload this file: https://www.virustotal.com/gui/home/upload" >&2
+            echo "   📂 Open Folder: file://$dir_path/" >&2
+            echo "   📄 File: $base_name" >&2
         fi
     else
         echo "   ⚠️  Unexpected HTTP status $http_code – check your API key or network." >&2
+        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📄 File: $base_name" >&2
     fi
 }
 

@@ -165,7 +165,6 @@ upload_file() {
 
     local upload_response="/tmp/vt_upload_$$.json"
     local http_code
-    local final_sha="$sha"
 
     # Decide method based on size (32 MB threshold)
     if [[ "$filesize" -le "$DIRECT_UPLOAD_LIMIT" ]]; then
@@ -212,17 +211,8 @@ upload_file() {
 
     # Process the upload response
     if [[ "$http_code" -eq 200 ]]; then
-        # Extract the analysis ID (SHA-256) from the response
-        local analysis_id
-        if command -v jq &>/dev/null; then
-            analysis_id=$(jq -r '.data.id' "$upload_response" 2>/dev/null)
-        else
-            analysis_id=$(grep -o '"id":"[^"]*"' "$upload_response" 2>/dev/null | head -1 | cut -d'"' -f4)
-        fi
-        if [[ -n "$analysis_id" && "$analysis_id" != "null" ]]; then
-            final_sha="$analysis_id"
-        fi
-        local url="https://www.virustotal.com/gui/file/$final_sha"
+        # Use the file's SHA-256 directly – this is always correct for the URL
+        local url="https://www.virustotal.com/gui/file/$sha"
         echo "   ✅ Upload successful: $url" >&2
         echo "   Opening upload result page..." >&2
         open_url_background "$url"

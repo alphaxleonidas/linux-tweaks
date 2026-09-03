@@ -1,0 +1,483 @@
+#!/bin/bash
+
+# ----------------------------------------------------------------------
+# Nautilus script: vt-scan
+# Purpose: Scan selected files/folders with VirusTotal, show stats,
+#          open reports in background tabs (optional), and upload missing files.
+# Usage:   Right-click on files/folders -> Scripts -> vt-scan
+# ----------------------------------------------------------------------
+
+# #!/data/data/com.termux/files/usr/bin/bash # uncomment this shebang for termux
+
+# Running directly inside Termux
+export VT_SCAN_RUNNING=1
+
+# ---- Now we are in a terminal ----
+API_KEY_FILE="$HOME/.vt_api_key"
+TMP_RESPONSE="/tmp/vt_response_$$.json"
+trap 'rm -f "$TMP_RESPONSE"' EXIT
+
+# Global variables
+OPEN_BROWSER=true
+TAB_COUNT=0
+PAUSE_AFTER=20
+UPLOAD_MISSING=false
+MISSING_FILES=()
+REPORT_URLS=()
+
+# VirusTotal upload limit (650 MB)
+MAX_UPLOAD_BYTES=$((650 * 1024 * 1024))
+DIRECT_UPLOAD_LIMIT=$((32 * 1024 * 1024))
+
+# ----------------------------- Helper Functions --------------------------
+
+save_api_key() {
+    read -rp "Enter your VirusTotal API key: " API_KEY
+    if [[ -z "$API_KEY" ]]; then
+        echo "Error: API key cannot be empty." >&2
+        exit 1
+    fi
+    echo "$API_KEY" > "$API_KEY_FILE"
+    chmod 600 "$API_KEY_FILE"
+    echo "API key saved to $API_KEY_FILE"
+}
+
+get_api_key() {
+    if [[ "$1" == "--reset-key" ]]; then
+        save_api_key
+        return
+    fi
+    if [[ -f "$API_KEY_FILE" ]]; then
+        API_KEY=$(<"$API_KEY_FILE")
+        if [[ -z "$API_KEY" ]]; then
+            echo "Stored API key is empty. Please re-enter." >&2
+            save_api_key
+        fi
+    else
+        echo "No API key found. Please enter one." >&2
+        save_api_key
+    fi
+}
+
+# Open URL in background tab (Linux)
+open_url_background() {
+    local url="$1"
+    if command -v xdotool &>/dev/null; then
+        local current_win
+        current_win=$(xdotool getwindowfocus 2>/dev/null)
+        if [[ -z "$current_win" ]]; then
+            current_win=$(xdotool getactivewindow 2>/dev/null)
+        fi
+        (xdg-open "$url" &) 2>/dev/null
+        sleep 1
+        if [[ -n "$current_win" ]]; then
+            xdotool windowactivate "$current_win" 2>/dev/null
+            sleep 0.2
+            xdotool windowactivate "$current_win" 2>/dev/null
+        fi
+        return
+    fi
+    (xdg-open "$url" &) 2>/dev/null
+}
+
+# Convert file:// URI to path
+uri_to_path() {
+    local uri="$1"
+    local path="${uri#file://}"
+    path=$(echo -e "$path" | sed -e 's/%20/ /g')
+    echo "$path"
+}
+
+# Extract stats from VT JSON
+extract_stats() {
+    local json_file="$1"
+    if command -v jq &>/dev/null; then
+        jq -r '.data.attributes.last_analysis_stats | 
+            "malicious: \(.malicious // 0)\nsuspicious: \(.suspicious // 0)\nundetected: \(.undetected // 0)\nharmless: \(.harmless // 0)\ntimeout: \(.timeout // 0)"' "$json_file" 2>/dev/null
+    else
+        local malicious=$(grep -o '"malicious":[[:space:]]*[0-9]*' "$json_file" 2>/dev/null | grep -o '[0-9]*$' | head -1)
+        local suspicious=$(grep -o '"suspicious":[[:space:]]*[0-9]*' "$json_file" 2>/dev/null | grep -o '[0-9]*$' | head -1)
+        local undetected=$(grep -o '"undetected":[[:space:]]*[0-9]*' "$json_file" 2>/dev/null | grep -o '[0-9]*$' | head -1)
+        local harmless=$(grep -o '"harmless":[[:space:]]*[0-9]*' "$json_file" 2>/dev/null | grep -o '[0-9]*$' | head -1)
+        local timeout=$(grep -o '"timeout":[[:space:]]*[0-9]*' "$json_file" 2>/dev/null | grep -o '[0-9]*$' | head -1)
+        malicious=${malicious:-0}
+        suspicious=${suspicious:-0}
+        undetected=${undetected:-0}
+        harmless=${harmless:-0}
+        timeout=${timeout:-0}
+        echo "malicious: $malicious"
+        echo "suspicious: $suspicious"
+        echo "undetected: $undetected"
+        echo "harmless: $harmless"
+        echo "timeout: $timeout"
+    fi
+}
+
+# Get file size in bytes (cross-platform)
+get_file_size() {
+    local file="$1"
+    if command -v stat &>/dev/null; then
+        if stat -c '%s' "$file" 2>/dev/null; then
+            return
+        elif stat -f '%z' "$file" 2>/dev/null; then
+            return
+        fi
+    fi
+    # fallback: wc -c
+    wc -c < "$file" 2>/dev/null | tr -d ' '
+}
+
+# Upload a single file to VirusTotal – with 650 MB limit check
+upload_file() {
+    local file="$1"
+    local sha="$2"
+    if [[ -z "$sha" ]]; then
+        sha=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+        if [[ -z "$sha" ]]; then
+            echo "   ⚠️  Could not compute hash for '$file' – skipping upload." >&2
+            return 1
+        fi
+    fi
+
+    # Check file size against 650 MB limit
+    local filesize
+    filesize=$(get_file_size "$file")
+    if [[ -z "$filesize" ]]; then
+        echo "   ⚠️  Could not determine file size for '$file' – skipping." >&2
+        return 1
+    fi
+    if [[ "$filesize" -gt "$MAX_UPLOAD_BYTES" ]]; then
+        local size_mb=$(( filesize / 1024 / 1024 ))
+        echo "   ⚠️  File too large (${size_mb}MB) – VirusTotal limit is 650MB. Skipping upload." >&2
+        return 1
+    fi
+
+    local upload_response="/tmp/vt_upload_$$.json"
+    local http_code
+
+    # Decide method based on size (32 MB threshold)
+    if [[ "$filesize" -le "$DIRECT_UPLOAD_LIMIT" ]]; then
+        # ---- Direct upload (≤32 MB) ----
+        echo "   ⬆️  Uploading (direct): $(basename "$file")" >&2
+        http_code=$(curl -s -o "$upload_response" -w "%{http_code}" \
+            -X POST \
+            -H "x-apikey: $API_KEY" \
+            -F "file=@$file" \
+            "https://www.virustotal.com/api/v3/files")
+    else
+        # ---- Two-step upload via upload_url (>32 MB and ≤650 MB) ----
+        echo "   ⬆️  Uploading (large file via upload_url): $(basename "$file")" >&2
+        # Step 1: Request an upload URL
+        local upload_url_response="/tmp/vt_upload_url_$$.json"
+        http_code=$(curl -s -o "$upload_url_response" -w "%{http_code}" \
+            -X GET \
+            -H "x-apikey: $API_KEY" \
+            "https://www.virustotal.com/api/v3/files/upload_url")
+        if [[ "$http_code" -ne 200 ]]; then
+            echo "   ❌ Failed to get upload URL (HTTP $http_code)." >&2
+            rm -f "$upload_url_response"
+            return 1
+        fi
+        # Extract the upload URL from the response
+        local upload_url
+        if command -v jq &>/dev/null; then
+            upload_url=$(jq -r '.data' "$upload_url_response" 2>/dev/null)
+        else
+            upload_url=$(grep -o '"data":"[^"]*"' "$upload_url_response" 2>/dev/null | head -1 | cut -d'"' -f4)
+        fi
+        rm -f "$upload_url_response"
+        if [[ -z "$upload_url" || "$upload_url" == "null" ]]; then
+            echo "   ❌ Could not extract upload URL from response." >&2
+            return 1
+        fi
+
+        # Step 2: PUT the file to the upload URL
+        http_code=$(curl -s -o "$upload_response" -w "%{http_code}" \
+            -X PUT \
+            --upload-file "$file" \
+            "$upload_url")
+    fi
+
+    # Process the upload response
+    if [[ "$http_code" -eq 200 ]]; then
+        # Use the file's SHA-256 directly – this is always correct for the URL
+        local url="https://www.virustotal.com/gui/file/$sha"
+        echo "   ✅ Upload successful: $url" >&2
+        echo "   Opening upload result page..." >&2
+        open_url_background "$url"
+        if command -v notify-send &>/dev/null; then
+            notify-send -t 5000 "VirusTotal Upload" "Uploaded: $(basename "$file")" 2>/dev/null
+        fi
+    elif [[ "$http_code" -eq 413 ]]; then
+        echo "   ❌ Upload failed: file too large (413). VirusTotal's limit is 650MB." >&2
+    else
+        echo "   ❌ Upload failed (HTTP $http_code)." >&2
+        cat "$upload_response" >&2 2>/dev/null
+    fi
+    rm -f "$upload_response"
+    return 0
+}
+
+# Process a single file
+process_file() {
+    local file="$1"
+    local sha
+    sha=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    if [[ -z "$sha" ]]; then
+        echo "⚠️  Could not compute hash for '$file' – skipping." >&2
+        return
+    fi
+
+    local abs_path
+    abs_path=$(realpath "$file")
+    local dir_path
+    dir_path=$(dirname "$abs_path")
+    local base_name
+    base_name=$(basename "$abs_path")
+
+    echo "➜ Processing: $abs_path" >&2
+    echo "   SHA256: $sha" >&2
+
+    http_code=$(curl -s -o "$TMP_RESPONSE" -w "%{http_code}" \
+        -H "x-apikey: $API_KEY" \
+        "https://www.virustotal.com/api/v3/files/$sha")
+
+    if [[ "$http_code" -eq 200 ]]; then
+        report_url="https://www.virustotal.com/gui/file/$sha"
+        REPORT_URLS+=("$report_url")
+
+        echo "   📊 Stats:" >&2
+        extract_stats "$TMP_RESPONSE" | sed -e 's/malicious:/☠️ malicious:/' \
+                                            -e 's/suspicious:/⚠️ suspicious:/' \
+                                            -e 's/undetected:/✅ undetected:/' \
+                                            -e 's/harmless:/😇 harmless:/' \
+                                            -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
+        echo "   🔗 Report: $report_url" >&2
+
+        if [[ "$OPEN_BROWSER" == true ]]; then
+            echo "   Opening browser tab in background..." >&2
+            open_url_background "$report_url"
+            ((TAB_COUNT++))
+        else
+            echo "   (Browser opening disabled)" >&2
+        fi
+
+        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📄 File: $base_name" >&2
+
+        if [[ "$OPEN_BROWSER" == true ]] && (( TAB_COUNT % PAUSE_AFTER == 0 )); then
+            read -rp "Opened $TAB_COUNT tabs. Continue opening? (Y/n): " cont
+            if [[ -z "$cont" ]]; then
+                cont="y"
+            fi
+            if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+                OPEN_BROWSER=false
+                echo "   🔒 Further browser opening disabled." >&2
+            fi
+        fi
+
+    elif [[ "$http_code" -eq 404 ]]; then
+        echo "   ❌ No report found for this hash." >&2
+        echo "   💡 Upload this file: https://www.virustotal.com/gui/home/upload" >&2
+        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📄 File: $base_name" >&2
+
+        if [[ "$UPLOAD_MISSING" == true ]]; then
+            upload_file "$abs_path" "$sha"
+        else
+            MISSING_FILES+=("$abs_path")
+        fi
+
+    elif [[ "$http_code" -eq 429 ]]; then
+        echo "   ⏳ Rate limit exceeded. Waiting 60 seconds then retrying..." >&2
+        sleep 60
+        http_code=$(curl -s -o "$TMP_RESPONSE" -w "%{http_code}" \
+            -H "x-apikey: $API_KEY" \
+            "https://www.virustotal.com/api/v3/files/$sha")
+        if [[ "$http_code" -eq 200 ]]; then
+            report_url="https://www.virustotal.com/gui/file/$sha"
+            REPORT_URLS+=("$report_url")
+            echo "   📊 Stats:" >&2
+            extract_stats "$TMP_RESPONSE" | sed -e 's/malicious:/☠️ malicious:/' \
+                                                -e 's/suspicious:/⚠️ suspicious:/' \
+                                                -e 's/undetected:/✅ undetected:/' \
+                                                -e 's/harmless:/😇 harmless:/' \
+                                                -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
+            echo "   🔗 Report: $report_url" >&2
+            if [[ "$OPEN_BROWSER" == true ]]; then
+                echo "   Opening browser tab..." >&2
+                open_url_background "$report_url"
+                ((TAB_COUNT++))
+            else
+                echo "   (Browser opening disabled)" >&2
+            fi
+            echo "   📂 Open Folder: file://$dir_path/" >&2
+            echo "   📄 File: $base_name" >&2
+            if [[ "$OPEN_BROWSER" == true ]] && (( TAB_COUNT % PAUSE_AFTER == 0 )); then
+                read -rp "Opened $TAB_COUNT tabs. Continue opening? (Y/n): " cont
+                if [[ -z "$cont" ]]; then
+                    cont="y"
+                fi
+                if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+                    OPEN_BROWSER=false
+                    echo "   🔒 Further browser opening disabled." >&2
+                fi
+            fi
+        else
+            echo "   ❌ Still no report (HTTP $http_code)." >&2
+            echo "   💡 Upload this file: https://www.virustotal.com/gui/home/upload" >&2
+            echo "   📂 Open Folder: file://$dir_path/" >&2
+            echo "   📄 File: $base_name" >&2
+            if [[ "$UPLOAD_MISSING" == true ]]; then
+                upload_file "$abs_path" "$sha"
+            else
+                MISSING_FILES+=("$abs_path")
+            fi
+        fi
+    else
+        echo "   ⚠️  Unexpected HTTP status $http_code – check your API key or network." >&2
+        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📄 File: $base_name" >&2
+    fi
+}
+
+# ----------------------------- Main Script ------------------------------
+
+if [[ "$1" == "--reset-key" ]]; then
+    save_api_key
+    exit 0
+fi
+
+get_api_key
+
+# Gather files
+FILES_TO_SCAN=()
+ALL_FILES=()
+
+if [[ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]]; then
+    while IFS= read -r item; do
+        [[ -n "$item" ]] && FILES_TO_SCAN+=("$item")
+    done <<< "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
+elif [[ -n "$NAUTILUS_SCRIPT_CURRENT_URI" ]]; then
+    current_path=$(uri_to_path "$NAUTILUS_SCRIPT_CURRENT_URI")
+    FILES_TO_SCAN+=("$current_path")
+else
+    FILES_TO_SCAN+=(".")
+fi
+
+if [[ ${#FILES_TO_SCAN[@]} -eq 0 ]]; then
+    echo "No files or folders to scan." >&2
+    exit 1
+fi
+
+echo "Collecting files..." >&2
+for item in "${FILES_TO_SCAN[@]}"; do
+    if [[ -d "$item" ]]; then
+        while IFS= read -r -d '' file; do
+            ALL_FILES+=("$file")
+        done < <(find "$item" -type f -print0 2>/dev/null)
+    elif [[ -f "$item" ]]; then
+        ALL_FILES+=("$item")
+    else
+        echo "Warning: '$item' is not a regular file or directory." >&2
+    fi
+done
+
+total_files=${#ALL_FILES[@]}
+if [[ $total_files -eq 0 ]]; then
+    echo "No regular files found to scan." >&2
+    exit 1
+fi
+
+echo "Found $total_files files to scan." >&2
+read -rp "Do you want to proceed? (Y/n): " answer
+if [[ -z "$answer" ]]; then
+    answer="y"
+fi
+if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    echo "Aborted." >&2
+    exit 0
+fi
+
+# Ask about uploading missing files
+read -rp "Upload files with no VirusTotal report? (y/N): " upload_ans
+if [[ "$upload_ans" =~ ^[Yy]$ ]]; then
+    UPLOAD_MISSING=true
+    echo "Will upload missing files on the fly." >&2
+else
+    echo "Will collect missing files for later." >&2
+fi
+
+# Ask about browser opening - default is now N
+read -rp "Open reports in browser during scan? (y/N): " open_browser_ans
+if [[ "$open_browser_ans" =~ ^[Yy]$ ]]; then
+    OPEN_BROWSER=true
+else
+    OPEN_BROWSER=false
+    echo "Browser opening during scan disabled." >&2
+fi
+
+echo "Starting VirusTotal scan..." >&2
+echo "Rate limit: 15 seconds between requests." >&2
+echo "------------------------------------------------------------" >&2
+
+for file in "${ALL_FILES[@]}"; do
+    process_file "$file"
+    echo >&2   # blank line between files
+done
+
+echo "------------------------------------------------------------" >&2
+echo "All files processed." >&2
+
+# Handle missing files (upload if not done on the fly) - filter out oversized (>650MB)
+if [[ "$UPLOAD_MISSING" == false ]] && [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
+    echo "Found ${#MISSING_FILES[@]} files with no VirusTotal report." >&2
+    # Filter out files larger than 650MB
+    local filtered_files=()
+    for f in "${MISSING_FILES[@]}"; do
+        sz=$(get_file_size "$f")
+        if [[ -n "$sz" ]] && [[ "$sz" -le "$MAX_UPLOAD_BYTES" ]]; then
+            filtered_files+=("$f")
+        else
+            echo "   ⚠️  Skipping oversized file: $(basename "$f") ( >650MB )" >&2
+        fi
+    done
+    MISSING_FILES=("${filtered_files[@]}")
+    if [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
+        read -rp "Do you want to upload these ${#MISSING_FILES[@]} files now? (y/N): " upload_now
+        if [[ "$upload_now" =~ ^[Yy]$ ]]; then
+            read -rp "Are you sure? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Uploading ${#MISSING_FILES[@]} files..." >&2
+                for f in "${MISSING_FILES[@]}"; do
+                    upload_file "$f"
+                    echo >&2
+                done
+            else
+                echo "Upload cancelled." >&2
+            fi
+        else
+            echo "Upload skipped." >&2
+        fi
+    else
+        echo "No uploadable files (all oversized)." >&2
+    fi
+fi
+
+# Offer to open all report links if we didn't open them during scan
+if [[ "$OPEN_BROWSER" == false ]] && [[ ${#REPORT_URLS[@]} -gt 0 ]]; then
+    echo "Found ${#REPORT_URLS[@]} report links that were not opened." >&2
+    read -rp "Open all report links in the browser now? (y/N): " open_all
+    if [[ "$open_all" =~ ^[Yy]$ ]]; then
+        echo "Opening ${#REPORT_URLS[@]} report links in background..." >&2
+        for url in "${REPORT_URLS[@]}"; do
+            open_url_background "$url"
+            sleep 0.5
+        done
+        echo "All links opened." >&2
+    else
+        echo "Skipped opening report links." >&2
+    fi
+fi
+
+read -p "Press Enter to close this window..." </dev/tty

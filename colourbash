@@ -1,0 +1,5 @@
+# Add this to ~/.bashrc to make bash differentiate directory from files using colour
+
+export LS_OPTIONS='--color=auto'
+eval "$(dircolors -b)"
+alias ls='ls $LS_OPTIONS'   

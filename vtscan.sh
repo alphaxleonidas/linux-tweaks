@@ -21,6 +21,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 KEY_FILE_1="$CONFIG_DIR/api_key1"
 KEY_FILE_2="$CONFIG_DIR/api_key2"
 KEY_FILE_3="$CONFIG_DIR/api_key3"
+KEY_FILE_4="$CONFIG_DIR/api_key4"
 LEGACY_KEY_FILE="$HOME/.vt_api_key"
 
 mkdir -p "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null
@@ -42,6 +43,17 @@ TAB_COUNT=0
 PAUSE_AFTER=20
 MISSING_FILES=()
 REPORT_URLS=()
+UPLOADED_REPORT_URLS=()
+UPLOADED_PATHS=()
+UPLOADED_SHAS=()
+UPLOADED_DIRS=()
+UPLOADED_BASES=()
+MALWARE_PATHS=()
+MALWARE_SHAS=()
+MALWARE_STATS=()
+MALWARE_URLS=()
+MALWARE_DIRS=()
+MALWARE_BASES=()
 
 MAX_UPLOAD_BYTES=$((650 * 1024 * 1024))   # VirusTotal hard limit
 DIRECT_UPLOAD_LIMIT=$((32 * 1024 * 1024)) # above this, VT requires the upload_url flow
@@ -93,8 +105,12 @@ OPTIONS:
   --reset-key3            (Re)enter the tertiary API key. Used automatically
                            when both the primary and secondary keys are
                            rate-limited.
+  --reset-key4            (Re)enter the quaternary API key. Used automatically
+                           when the primary, secondary, and tertiary keys are
+                           all rate-limited.
 
-  --write-config          Ask every setting below, save the answers to
+  --write-config, --config
+                           Ask every setting below, save the answers to
                            ~/.vtscan/config as the new defaults, then exit
                            without scanning anything.
   --use-config            Skip all setting prompts for this run and use
@@ -146,7 +162,7 @@ save_api_key() {
 # Build the ordered list of usable API keys.
 load_api_keys() {
     API_KEYS=()
-    for f in "$KEY_FILE_1" "$KEY_FILE_2" "$KEY_FILE_3"; do
+    for f in "$KEY_FILE_1" "$KEY_FILE_2" "$KEY_FILE_3" "$KEY_FILE_4"; do
         if [[ -f "$f" ]]; then
             local k
             k=$(<"$f")
@@ -169,6 +185,13 @@ load_api_keys() {
             if [[ "$add_tertiary" =~ ^[Yy]$ ]]; then
                 save_api_key 3 "$KEY_FILE_3" "tertiary"
                 API_KEYS+=("$(<"$KEY_FILE_3")")
+
+                local add_quaternary
+                read -rp "Add a quaternary API key too (used if all three others are rate-limited)? (y/N): " add_quaternary
+                if [[ "$add_quaternary" =~ ^[Yy]$ ]]; then
+                    save_api_key 4 "$KEY_FILE_4" "quaternary"
+                    API_KEYS+=("$(<"$KEY_FILE_4")")
+                fi
             fi
         fi
     fi
@@ -180,7 +203,7 @@ current_api_key() { echo "${API_KEYS[$CURRENT_KEY_IDX]}"; }
 rotate_key() {
     if (( CURRENT_KEY_IDX + 1 < ${#API_KEYS[@]} )); then
         ((CURRENT_KEY_IDX++))
-        echo "   🔑 Primary/secondary key rate-limited - switching to backup key #$((CURRENT_KEY_IDX + 1))." >&2
+        echo "   🔑 Current key rate-limited - switching to backup key #$((CURRENT_KEY_IDX + 1))." >&2
         return 0
     fi
     return 1
@@ -272,11 +295,6 @@ run_setting_prompts() {
     prompt_yn "Open reports in browser during the scan" "$OPEN_BROWSER_SCAN" OPEN_BROWSER_SCAN
     prompt_yn "Allow uploading large files (>32MB, needs VirusTotal's slower upload path)" "$ALLOW_LARGE_UPLOADS" ALLOW_LARGE_UPLOADS
     prompt_yn "Show a desktop notification after each successful upload" "$NOTIFY" NOTIFY
-    prompt_yn "Save these answers as your default config" "false" SAVE_AS_DEFAULT
-    if [[ "$SAVE_AS_DEFAULT" == "true" ]]; then
-        prompt_yn "Also skip these prompts entirely next time (always use the saved config)" "$SKIP_PROMPTS" SKIP_PROMPTS
-        write_config
-    fi
 }
 
 # ----------------------------- Misc helpers -------------------------------
@@ -304,8 +322,30 @@ open_url_background() {
 uri_to_path() {
     local uri="$1"
     local path="${uri#file://}"
-    path=$(echo -e "$path" | sed -e 's/%20/ /g')
-    echo "$path"
+    # Decode every %XX escape, not just %20 - Nautilus URI-encodes any
+    # character outside a small safe set, so accented letters, &, #, etc.
+    # need the same treatment as spaces.
+    printf '%b' "${path//%/\\x}"
+}
+
+# Percent-encode a filesystem path for use inside a file:// URL. Needed
+# because paths routinely contain spaces (and other characters) that a
+# literal file://<path> URL breaks on - browsers/file managers won't
+# resolve "file:///a b/c" correctly, but they will resolve "file:///a%20b/c".
+path_to_file_uri() {
+    local LC_ALL=C
+    local path="$1" out="" c i len=${#1}
+    for (( i=0; i<len; i++ )); do
+        c="${path:i:1}"
+        case "$c" in
+            [a-zA-Z0-9./_-]) out+="$c" ;;
+            *)
+                printf -v hex '%02X' "'$c"
+                out+="%$hex"
+                ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 extract_stats() {
@@ -410,18 +450,21 @@ upload_file() {
         # doesn't follow, so curl reports the 303 itself as if it were the
         # final result, even though the bytes were already sent over the
         # wire (hence "it looked like it uploaded, then failed at the end").
-        # No x-apikey header is sent here on purpose: this URL is
-        # pre-authorized, and VirusTotal's own docs upload to it the same
-        # way (POST + multipart, no key).
-        http_code=$(curl -s -o "$upload_response" -w "%{http_code}" -L \
-            -X POST \
-            -F "file=@$file" \
-            "$upload_url")
+        # It also turns out this URL is NOT pre-authorized on its own - VT
+        # returned "401 X-Apikey header is missing" without it, so the key
+        # has to be sent here too, same as every other VT API call. Routed
+        # through vt_request so a rate-limit here also rotates keys.
+        http_code=$(vt_request POST "$upload_url" "$upload_response" -L -F "file=@$file")
     fi
 
     if [[ "$http_code" == "200" ]]; then
         local url="https://www.virustotal.com/gui/file/$sha"
         echo "   ✅ Upload successful: $url" >&2
+        UPLOADED_REPORT_URLS+=("$url")
+        UPLOADED_PATHS+=("$file")
+        UPLOADED_SHAS+=("$sha")
+        UPLOADED_DIRS+=("$(dirname "$file")")
+        UPLOADED_BASES+=("$(basename "$file")")
         if [[ "$open_flag" == "true" ]]; then
             echo "   Opening upload result page..." >&2
             open_url_background "$url"
@@ -440,6 +483,57 @@ upload_file() {
     fi
     rm -f "$upload_response"
     return 0
+}
+
+# Re-fetch and print the current VirusTotal report for a file that was
+# uploaded this run. Any malicious/suspicious result found here is folded
+# into the same MALWARE_* arrays process_file() uses, so it shows up in the
+# end-of-run malware summary too. On success, the report URL is appended to
+# the global UPLOADED_VIEW_URLS array so the caller can offer to open it.
+print_uploaded_result() {
+    local file="$1" sha="$2" dir_path="$3" base_name="$4"
+    local resp="/tmp/vt_view_$$_${RANDOM}.json"
+    local http_code
+    http_code=$(vt_request GET "https://www.virustotal.com/api/v3/files/$sha" "$resp")
+
+    echo "➜ Processing: $file" >&2
+    echo "   SHA256: $sha" >&2
+
+    if [[ "$http_code" == "200" ]]; then
+        local stats_raw malicious_count suspicious_count report_url
+        stats_raw=$(extract_stats "$resp")
+        malicious_count=$(echo "$stats_raw" | awk -F': ' '/^malicious:/{print $2}')
+        suspicious_count=$(echo "$stats_raw" | awk -F': ' '/^suspicious:/{print $2}')
+        malicious_count=${malicious_count:-0}
+        suspicious_count=${suspicious_count:-0}
+        report_url="https://www.virustotal.com/gui/file/$sha"
+
+        echo "   📊 Stats:" >&2
+        echo "$stats_raw" | sed -e 's/malicious:/☠️ malicious:/' \
+                                 -e 's/suspicious:/⚠️ suspicious:/' \
+                                 -e 's/undetected:/✅ undetected:/' \
+                                 -e 's/harmless:/😇 harmless:/' \
+                                 -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
+        echo "   🔗 Report: $report_url" >&2
+        echo "   📂 Open Folder: file://$(path_to_file_uri "$dir_path")/" >&2
+        echo "   📄 File: $base_name" >&2
+
+        if [[ "$malicious_count" -gt 0 || "$suspicious_count" -gt 0 ]]; then
+            MALWARE_PATHS+=("$file")
+            MALWARE_SHAS+=("$sha")
+            MALWARE_STATS+=("$stats_raw")
+            MALWARE_URLS+=("$report_url")
+            MALWARE_DIRS+=("$dir_path")
+            MALWARE_BASES+=("$base_name")
+        fi
+        UPLOADED_VIEW_URLS+=("$report_url")
+    else
+        echo "   ⏳ No results yet (HTTP $http_code) - VirusTotal may still be analyzing this upload." >&2
+        echo "   📂 Open Folder: file://$(path_to_file_uri "$dir_path")/" >&2
+        echo "   📄 File: $base_name" >&2
+    fi
+    rm -f "$resp"
+    echo >&2
 }
 
 # ----------------------------- Scan a single file ---------------------------
@@ -468,13 +562,29 @@ process_file() {
         local report_url="https://www.virustotal.com/gui/file/$sha"
         REPORT_URLS+=("$report_url")
 
+        local stats_raw malicious_count suspicious_count
+        stats_raw=$(extract_stats "$TMP_RESPONSE")
+        malicious_count=$(echo "$stats_raw" | awk -F': ' '/^malicious:/{print $2}')
+        suspicious_count=$(echo "$stats_raw" | awk -F': ' '/^suspicious:/{print $2}')
+        malicious_count=${malicious_count:-0}
+        suspicious_count=${suspicious_count:-0}
+
         echo "   📊 Stats:" >&2
-        extract_stats "$TMP_RESPONSE" | sed -e 's/malicious:/☠️ malicious:/' \
+        echo "$stats_raw" | sed -e 's/malicious:/☠️ malicious:/' \
                                             -e 's/suspicious:/⚠️ suspicious:/' \
                                             -e 's/undetected:/✅ undetected:/' \
                                             -e 's/harmless:/😇 harmless:/' \
                                             -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
         echo "   🔗 Report: $report_url" >&2
+
+        if [[ "$malicious_count" -gt 0 || "$suspicious_count" -gt 0 ]]; then
+            MALWARE_PATHS+=("$abs_path")
+            MALWARE_SHAS+=("$sha")
+            MALWARE_STATS+=("$stats_raw")
+            MALWARE_URLS+=("$report_url")
+            MALWARE_DIRS+=("$dir_path")
+            MALWARE_BASES+=("$base_name")
+        fi
 
         if [[ "$OPEN_BROWSER_SCAN" == "true" ]]; then
             echo "   Opening browser tab in background..." >&2
@@ -484,7 +594,7 @@ process_file() {
             echo "   (Browser opening disabled)" >&2
         fi
 
-        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📂 Open Folder: file://$(path_to_file_uri "$dir_path")/" >&2
         echo "   📄 File: $base_name" >&2
 
         if [[ "$OPEN_BROWSER_SCAN" == "true" ]] && (( TAB_COUNT % PAUSE_AFTER == 0 )); then
@@ -499,7 +609,7 @@ process_file() {
 
     elif [[ "$http_code" == "404" ]]; then
         echo "   ❌ No report found for this hash." >&2
-        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📂 Open Folder: file://$(path_to_file_uri "$dir_path")/" >&2
         echo "   📄 File: $base_name" >&2
 
         if [[ "$UPLOAD_MISSING" == "true" ]]; then
@@ -510,7 +620,7 @@ process_file() {
         fi
     else
         echo "   ⚠️  Unexpected HTTP status $http_code - check your API key(s) or network." >&2
-        echo "   📂 Open Folder: file://$dir_path/" >&2
+        echo "   📂 Open Folder: file://$(path_to_file_uri "$dir_path")/" >&2
         echo "   📄 File: $base_name" >&2
     fi
 }
@@ -536,7 +646,11 @@ while [[ $# -gt 0 ]]; do
             save_api_key 3 "$KEY_FILE_3" "tertiary"
             exit 0
             ;;
-        --write-config)
+        --reset-key4)
+            save_api_key 4 "$KEY_FILE_4" "quaternary"
+            exit 0
+            ;;
+        --write-config|--config)
             WRITE_CONFIG_MODE=true
             shift
             ;;
@@ -589,7 +703,7 @@ LOG_FILE="$LOG_DIR/scan_$(date '+%Y%m%d-%H%M%S').log"
 # Extremely unlikely, but don't clobber a log from the same second.
 [[ -e "$LOG_FILE" ]] && LOG_FILE="$LOG_DIR/scan_$(date '+%Y%m%d-%H%M%S')_$$.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
-echo "Logging this run to: file://$LOG_FILE" >&2
+echo "Logging this run to: file://$(path_to_file_uri "$LOG_FILE")" >&2
 
 # ----------------------------- Load config, then apply prompts/flags --------
 
@@ -605,6 +719,8 @@ SKIP_PROMPTS="$CFG_SKIP_PROMPTS"
 if [[ "$WRITE_CONFIG_MODE" == "true" ]]; then
     echo "Answer the questions below to set your saved defaults." >&2
     run_setting_prompts
+    prompt_yn "Skip these prompts entirely on future runs (always use this saved config)" "$SKIP_PROMPTS" SKIP_PROMPTS
+    write_config
     exit 0
 fi
 
@@ -720,7 +836,7 @@ if [[ "$UPLOAD_MISSING" == "false" ]] && [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
                     f_dir=$(dirname "$f")
                     f_base=$(basename "$f")
                     echo "➜ Processing: $f_dir/" >&2
-                    echo "   📂 Open Folder: file://$f_dir/" >&2
+                    echo "   📂 Open Folder: file://$(path_to_file_uri "$f_dir")/" >&2
                     echo "   📄 File: $f_base" >&2
                     upload_file "$f" "" "$OPEN_BROWSER_UPLOAD_BATCH"
                     echo >&2
@@ -733,6 +849,36 @@ if [[ "$UPLOAD_MISSING" == "false" ]] && [[ ${#MISSING_FILES[@]} -gt 0 ]]; then
         fi
     else
         echo "No uploadable files (all oversized)." >&2
+    fi
+fi
+
+# ----------------------------- View uploaded files' results -----------------
+# Only files that were actually uploaded this run - not ones that already had
+# an existing VirusTotal report (those are handled by the section below).
+
+if [[ ${#UPLOADED_REPORT_URLS[@]} -gt 0 ]]; then
+    echo "You uploaded ${#UPLOADED_REPORT_URLS[@]} file(s) this run." >&2
+    read -rp "View results of the uploaded files now, oldest to newest? (Y/n): " view_uploaded
+    view_uploaded="${view_uploaded:-y}"
+    if [[ "$view_uploaded" =~ ^[Yy]$ ]]; then
+        UPLOADED_VIEW_URLS=()
+        for i in "${!UPLOADED_SHAS[@]}"; do
+            print_uploaded_result "${UPLOADED_PATHS[$i]}" "${UPLOADED_SHAS[$i]}" "${UPLOADED_DIRS[$i]}" "${UPLOADED_BASES[$i]}"
+        done
+        if [[ ${#UPLOADED_VIEW_URLS[@]} -gt 0 ]]; then
+            read -rp "Open ${#UPLOADED_VIEW_URLS[@]} of these report(s) in the browser too? (y/N): " open_uploaded_browser
+            if [[ "$open_uploaded_browser" =~ ^[Yy]$ ]]; then
+                for url in "${UPLOADED_VIEW_URLS[@]}"; do
+                    open_url_background "$url"
+                    sleep 0.5
+                done
+                echo "Opened in browser." >&2
+            else
+                echo "Skipped opening in browser." >&2
+            fi
+        fi
+    else
+        echo "Skipped viewing uploaded-file reports." >&2
     fi
 fi
 
@@ -753,5 +899,27 @@ if [[ "$OPEN_BROWSER_SCAN" == "false" ]] && [[ ${#REPORT_URLS[@]} -gt 0 ]]; then
     fi
 fi
 
-echo "Full log saved to: file://$LOG_FILE" >&2
+# ----------------------------- Malware summary -------------------------------
+
+if [[ ${#MALWARE_PATHS[@]} -gt 0 ]]; then
+    echo "------------------------------------------------------------" >&2
+    echo "Malware detected." >&2
+    for i in "${!MALWARE_PATHS[@]}"; do
+        echo "File: ${MALWARE_PATHS[$i]}" >&2
+        echo "   SHA256: ${MALWARE_SHAS[$i]}" >&2
+        echo "   📊 Stats:" >&2
+        echo "${MALWARE_STATS[$i]}" | sed -e 's/malicious:/☠️ malicious:/' \
+                                          -e 's/suspicious:/⚠️ suspicious:/' \
+                                          -e 's/undetected:/✅ undetected:/' \
+                                          -e 's/harmless:/😇 harmless:/' \
+                                          -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
+        echo "   🔗 Report: ${MALWARE_URLS[$i]}" >&2
+        echo "   📂 Open Folder: file://$(path_to_file_uri "${MALWARE_DIRS[$i]}")/" >&2
+        echo "   📄 File: ${MALWARE_BASES[$i]}" >&2
+        echo >&2
+    done
+    echo "${#MALWARE_PATHS[@]} of $total_files file(s) flagged as malicious/suspicious." >&2
+fi
+
+echo "Full log saved to: file://$(path_to_file_uri "$LOG_FILE")" >&2
 read -p "Press Enter to close this window..." </dev/tty

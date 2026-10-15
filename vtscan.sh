@@ -64,6 +64,7 @@ CFG_OPEN_BROWSER_UPLOAD_LIVE=false  # open browser for on-the-fly uploads
 CFG_OPEN_BROWSER_UPLOAD_BATCH=false # open browser for the end-of-run batch upload
 CFG_ALLOW_LARGE_UPLOADS=true     # allow the >32MB upload_url path at all
 CFG_NOTIFY=false                 # desktop notification on successful upload
+CFG_BEHAVIOR=false               # show sandbox behavior analysis per file (+2 API requests/file)
 CFG_SKIP_PROMPTS=false           # if true, never ask - just use these values
 
 # Values actually used this run (start as copies of the config defaults,
@@ -74,10 +75,13 @@ OPEN_BROWSER_UPLOAD_LIVE="$CFG_OPEN_BROWSER_UPLOAD_LIVE"
 OPEN_BROWSER_UPLOAD_BATCH="$CFG_OPEN_BROWSER_UPLOAD_BATCH"
 ALLOW_LARGE_UPLOADS="$CFG_ALLOW_LARGE_UPLOADS"
 NOTIFY="$CFG_NOTIFY"
+BEHAVIOR="$CFG_BEHAVIOR"
 SKIP_PROMPTS="$CFG_SKIP_PROMPTS"
+BEHAVIOR_UNAVAILABLE=false   # flipped on if VT says this key can't read behaviour data
 
 CLI_ALLOW_LARGE=""   # "" = not set on CLI, "true"/"false" = forced
 CLI_NOTIFY=""
+CLI_BEHAVIOR=""
 FORCE_ASK=false
 FORCE_USE_CONFIG=false
 WRITE_CONFIG_MODE=false
@@ -129,6 +133,15 @@ OPTIONS:
   --notify                Show a desktop notification after each successful
                            upload. Overrides config.
   --no-notify             Don't show desktop notifications. Overrides config.
+
+  --behavior              After each file's stats, also show VirusTotal's
+                           sandbox "Behavior" data: an activity summary
+                           (detections, MITRE signatures by severity, IDS
+                           rules, Sigma rules, dropped files, network comms)
+                           and the MITRE ATT&CK tactics/techniques tree.
+                           Costs 2 extra API requests per file, and needs
+                           python3. Overrides config.
+  --no-behavior           Don't fetch/show behavior data. Overrides config.
 
 CONFIG & LOGS:
   Settings live in ~/.vtscan/config (created with --write-config, or the
@@ -250,7 +263,7 @@ load_config() {
         [[ -z "$key" || "$key" == \#* ]] && continue
         case "$key" in
             CFG_OPEN_BROWSER_SCAN|CFG_UPLOAD_MISSING|CFG_OPEN_BROWSER_UPLOAD_LIVE|\
-            CFG_OPEN_BROWSER_UPLOAD_BATCH|CFG_ALLOW_LARGE_UPLOADS|CFG_NOTIFY|CFG_SKIP_PROMPTS)
+            CFG_OPEN_BROWSER_UPLOAD_BATCH|CFG_ALLOW_LARGE_UPLOADS|CFG_NOTIFY|CFG_BEHAVIOR|CFG_SKIP_PROMPTS)
                 printf -v "$key" '%s' "$value"
                 ;;
         esac
@@ -266,6 +279,7 @@ CFG_OPEN_BROWSER_UPLOAD_LIVE=$OPEN_BROWSER_UPLOAD_LIVE
 CFG_OPEN_BROWSER_UPLOAD_BATCH=$OPEN_BROWSER_UPLOAD_BATCH
 CFG_ALLOW_LARGE_UPLOADS=$ALLOW_LARGE_UPLOADS
 CFG_NOTIFY=$NOTIFY
+CFG_BEHAVIOR=$BEHAVIOR
 CFG_SKIP_PROMPTS=$SKIP_PROMPTS
 EOF
     chmod 600 "$CONFIG_FILE"
@@ -295,6 +309,7 @@ run_setting_prompts() {
     prompt_yn "Open reports in browser during the scan" "$OPEN_BROWSER_SCAN" OPEN_BROWSER_SCAN
     prompt_yn "Allow uploading large files (>32MB, needs VirusTotal's slower upload path)" "$ALLOW_LARGE_UPLOADS" ALLOW_LARGE_UPLOADS
     prompt_yn "Show a desktop notification after each successful upload" "$NOTIFY" NOTIFY
+    prompt_yn "Show sandbox behavior analysis for each file (needs python3; +2 API requests per file)" "$BEHAVIOR" BEHAVIOR
 }
 
 # ----------------------------- Misc helpers -------------------------------
@@ -485,6 +500,284 @@ upload_file() {
     return 0
 }
 
+# Fetch and print VirusTotal's sandbox "Behavior" data for one file: an
+# activity summary (like the Behavior tab's header) followed by the MITRE
+# ATT&CK tactics/techniques tree. Uses two endpoints:
+#   GET /files/{id}/behaviour_summary       (merged sandbox report)
+#   GET /files/{id}/behaviour_mitre_trees   (ATT&CK tactics -> techniques -> signatures)
+# Does nothing unless BEHAVIOR=true. Never fails the scan: every error path
+# prints one line and returns.
+print_behavior() {
+    local sha="$1"
+    [[ "$BEHAVIOR" == "true" ]] || return 0
+    [[ "$BEHAVIOR_UNAVAILABLE" == "true" ]] && return 0
+
+    if ! command -v python3 &>/dev/null; then
+        echo "   🧪 Behavior: skipped - python3 is required to render it." >&2
+        BEHAVIOR_UNAVAILABLE=true
+        return 0
+    fi
+
+    local sum_resp="/tmp/vt_beh_sum_$$_${RANDOM}.json"
+    local mitre_resp="/tmp/vt_beh_mitre_$$_${RANDOM}.json"
+    local code
+    code=$(vt_request GET "https://www.virustotal.com/api/v3/files/$sha/behaviour_summary" "$sum_resp")
+    case "$code" in
+        200) ;;
+        404)
+            echo "   🧪 Behavior: no sandbox reports for this file (not executable, or not analyzed yet)." >&2
+            rm -f "$sum_resp" "$mitre_resp"
+            return 0
+            ;;
+        401|403)
+            echo "   🧪 Behavior: this API key can't read behavior data (HTTP $code) - skipping it for the rest of this run." >&2
+            BEHAVIOR_UNAVAILABLE=true
+            rm -f "$sum_resp" "$mitre_resp"
+            return 0
+            ;;
+        *)
+            echo "   🧪 Behavior: unexpected HTTP $code - skipping." >&2
+            rm -f "$sum_resp" "$mitre_resp"
+            return 0
+            ;;
+    esac
+
+    code=$(vt_request GET "https://www.virustotal.com/api/v3/files/$sha/behaviour_mitre_trees" "$mitre_resp")
+    [[ "$code" == "200" ]] || echo '{}' > "$mitre_resp"
+
+    python3 - "$sum_resp" "$mitre_resp" <<'PYEOF' >&2
+import json, sys, textwrap
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+summary = load(sys.argv[1])
+mitre = load(sys.argv[2])
+
+IND = "      "   # lines up under the "📊 Stats:" block
+CAP = 5          # max detail lines for IDS / Sigma / dropped / network
+INFO_CAP = 3     # INFO-level signatures are noise: show a few, count the rest
+ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
+EMOJI = {"CRITICAL": "🔴", "HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡", "INFO": "🔵"}
+
+# The merged summary puts fields directly under "data"; single-sandbox
+# reports nest them under "data.attributes". Accept both.
+d = summary.get("data")
+d = d if isinstance(d, dict) else {}
+d = d.get("attributes", d)
+d = d if isinstance(d, dict) else {}
+
+def as_list(v):
+    return v if isinstance(v, list) else []
+
+def sev(v):
+    return str(v or "UNKNOWN").upper()
+
+def badge(s):
+    return "%s %-6s" % (EMOJI.get(s, "⚪"), s)
+
+def sev_line(values):
+    cnt = {}
+    for v in values:
+        k = sev(v)
+        cnt[k] = cnt.get(k, 0) + 1
+    return "   ".join("%s %d %s" % (EMOJI.get(k, "⚪"), cnt[k], k)
+                      for k in sorted(cnt, key=lambda k: ORDER.get(k, 9)))
+
+def row(label, text):
+    print("%s%-12s %s" % (IND, label, text))
+
+def item(s, text, width=86):
+    """One severity-tagged line; long text wraps under itself."""
+    lines = textwrap.wrap(text or "?", width) or ["?"]
+    print("%s   %s  %s" % (IND, badge(s), lines[0]))
+    for ln in lines[1:]:
+        print("%s   %s%s" % (IND, " " * 11, ln))
+
+def more(n, what=""):
+    if n > 0:
+        print("%s   … and %d more%s (see the full report)" % (IND, n, what))
+
+# ---- MITRE: merge every sandbox, de-duplicate everything
+mitre_data = mitre.get("data")
+mitre_data = mitre_data if isinstance(mitre_data, dict) else {}
+tactics = {}      # tactic id -> {name, techs:{technique id -> name}}
+tech_names = {}   # technique id -> name, across all tactics (to label sub-technique parents)
+all_sigs = set()  # (severity, description) - unique across sandboxes/techniques
+for sandbox, body in mitre_data.items():
+    if not isinstance(body, dict):
+        continue
+    for t in as_list(body.get("tactics")):
+        if not isinstance(t, dict):
+            continue
+        tt = tactics.setdefault(t.get("id") or "?", {"name": t.get("name") or "?", "techs": {}})
+        for q in as_list(t.get("techniques")):
+            if not isinstance(q, dict):
+                continue
+            qid = q.get("id") or "?"
+            tt["techs"][qid] = q.get("name") or qid
+            tech_names[qid] = q.get("name") or qid
+            for sg in as_list(q.get("signatures")):
+                if isinstance(sg, dict):
+                    all_sigs.add((sev(sg.get("severity")), sg.get("description") or ""))
+
+# ---- Other summary sections
+verdicts = sorted({str(v) for v in as_list(d.get("verdicts"))})
+conf = d.get("verdict_confidence")
+ids = {}
+for a in as_list(d.get("ids_alerts")) or as_list(d.get("ids_results")):   # docs use both names
+    if isinstance(a, dict):
+        ids[(a.get("rule_id"), a.get("rule_msg"))] = a
+sigma = {}
+for r in as_list(d.get("sigma_analysis_results")):
+    if isinstance(r, dict):
+        sigma[(r.get("rule_id"), r.get("rule_title"))] = r
+dropped = {}
+for f in as_list(d.get("files_dropped")):
+    if isinstance(f, dict):
+        dropped[(f.get("path"), f.get("sha256"))] = f
+ip_traffic = {}
+for t in as_list(d.get("ip_traffic")):
+    if isinstance(t, dict):
+        ip_traffic[(t.get("transport_layer_protocol"), t.get("destination_ip"), t.get("destination_port"))] = t
+dns = as_list(d.get("dns_lookups"))
+http = as_list(d.get("http_conversations"))
+
+def verdict_badge(v):
+    u = v.upper()
+    if u in ("CLEAN", "HARMLESS"):
+        return "🟢 " + v
+    if u.startswith("UNKNOWN"):
+        return "⚪ " + v
+    return "🔴 " + v
+
+not_found = []
+
+print("   🧪 Behavior%s" % (" (%s)" % ", ".join(sorted(mitre_data)) if mitre_data else ""))
+
+# 1) Detections
+if verdicts:
+    det = " · ".join(verdict_badge(v) for v in verdicts)
+    if isinstance(conf, int):
+        det += "  (%d%% confidence)" % conf
+    row("Detections", det)
+else:
+    not_found.append("Detections")
+
+# 2) Signatures: the part that matters - worst first, each listed once
+if all_sigs:
+    row("Signatures", sev_line([s for s, _ in all_sigs]))
+    ordered = sorted(all_sigs, key=lambda x: (ORDER.get(x[0], 9), x[1]))
+    shown_info = 0
+    hidden_info = 0
+    for s, desc in ordered:
+        if s == "INFO":
+            if shown_info >= INFO_CAP:
+                hidden_info += 1
+                continue
+            shown_info += 1
+        item(s, desc)
+    more(hidden_info, " INFO")
+else:
+    not_found.append("Signatures")
+
+# 3) IDS / Sigma / dropped files / network: only when there is something
+if ids:
+    row("IDS rules", "%d   %s" % (len(ids), sev_line([a.get("alert_severity") for a in ids.values()])))
+    items = sorted(ids.values(), key=lambda a: ORDER.get(sev(a.get("alert_severity")), 9))
+    for a in items[:CAP]:
+        item(sev(a.get("alert_severity")), a.get("rule_msg"))
+    more(len(items) - CAP)
+else:
+    not_found.append("IDS rules")
+
+if sigma:
+    row("Sigma rules", "%d   %s" % (len(sigma), sev_line([r.get("rule_level") for r in sigma.values()])))
+    items = sorted(sigma.values(), key=lambda r: ORDER.get(sev(r.get("rule_level")), 9))
+    for r in items[:CAP]:
+        item(sev(r.get("rule_level")), r.get("rule_title"))
+    more(len(items) - CAP)
+else:
+    not_found.append("Sigma rules")
+
+if dropped:
+    row("Dropped", "%d file%s" % (len(dropped), "" if len(dropped) == 1 else "s"))
+    items = list(dropped.values())
+    for f in items[:CAP]:
+        sh = f.get("sha256")
+        print("%s   %s%s" % (IND, f.get("path") or "?", "  (sha256 %s…)" % sh[:12] if sh else ""))
+    more(len(items) - CAP)
+else:
+    not_found.append("Dropped files")
+
+net_lines = []
+for t in ip_traffic.values():
+    net_lines.append("%s %s:%s" % (str(t.get("transport_layer_protocol") or "?").lower(), t.get("destination_ip") or "?", t.get("destination_port") or "?"))
+for q in dns:
+    if isinstance(q, dict):
+        ips = ", ".join(str(i) for i in as_list(q.get("resolved_ips")))
+        net_lines.append("dns %s%s" % (q.get("hostname") or "?", " → " + ips if ips else ""))
+    else:
+        net_lines.append("dns %s" % q)
+for h in http:
+    if isinstance(h, dict):
+        net_lines.append("%s %s%s" % (h.get("request_method") or "?", h.get("url") or "?",
+                                      " [%s]" % h["response_status_code"] if h.get("response_status_code") else ""))
+    else:
+        net_lines.append("http %s" % h)
+if net_lines:
+    row("Network", "%d IP · %d DNS · %d HTTP" % (len(ip_traffic), len(dns), len(http)))
+    for ln in net_lines[:CAP]:
+        print("%s   %s" % (IND, ln))
+    more(len(net_lines) - CAP)
+else:
+    not_found.append("Network comms")
+
+# 4) ATT&CK: readable names, grouped by tactic. A sub-technique is shown
+#    under its parent ("Indicator Removal › Timestomp"); a parent that has
+#    sub-techniques in the same tactic is not repeated on its own line.
+def technique_lines(techs):
+    ids = sorted(techs)
+    out = []
+    for tid in ids:
+        if "." in tid:
+            parent = tid.split(".")[0]
+            pname = tech_names.get(parent)
+            out.append("%s › %s" % (pname, techs[tid]) if pname else techs[tid])
+        elif any(o.startswith(tid + ".") for o in ids):
+            continue
+        else:
+            out.append(techs[tid])
+    return out
+
+if tactics:
+    row("ATT&CK", "%d tactic%s" % (len(tactics), "" if len(tactics) == 1 else "s"))
+    w = max(len(t["name"]) for t in tactics.values())
+    for tid in sorted(tactics):
+        lines = technique_lines(tactics[tid]["techs"]) or ["-"]
+        print("%s   %-*s  %s" % (IND, w, tactics[tid]["name"], lines[0]))
+        for ln in lines[1:]:
+            print("%s   %-*s  %s" % (IND, w, "", ln))
+else:
+    not_found.append("ATT&CK")
+
+if not_found:
+    row("Not found", " · ".join(not_found))
+PYEOF
+
+    rm -f "$sum_resp" "$mitre_resp"
+}
+
 # Re-fetch and print the current VirusTotal report for a file that was
 # uploaded this run. Any malicious/suspicious result found here is folded
 # into the same MALWARE_* arrays process_file() uses, so it shows up in the
@@ -515,6 +808,7 @@ print_uploaded_result() {
                                  -e 's/harmless:/😇 harmless:/' \
                                  -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
         echo "   🔗 Report: $report_url" >&2
+        print_behavior "$sha"
         echo "   📂 Open Folder: file://$(path_to_file_uri "$dir_path")/" >&2
         echo "   📄 File: $base_name" >&2
 
@@ -576,6 +870,7 @@ process_file() {
                                             -e 's/harmless:/😇 harmless:/' \
                                             -e 's/timeout:/⏰ timeout:/' | sed 's/^/      /' >&2
         echo "   🔗 Report: $report_url" >&2
+        print_behavior "$sha"
 
         if [[ "$malicious_count" -gt 0 || "$suspicious_count" -gt 0 ]]; then
             MALWARE_PATHS+=("$abs_path")
@@ -678,6 +973,14 @@ while [[ $# -gt 0 ]]; do
             CLI_NOTIFY=false
             shift
             ;;
+        --behavior)
+            CLI_BEHAVIOR=true
+            shift
+            ;;
+        --no-behavior)
+            CLI_BEHAVIOR=false
+            shift
+            ;;
         --)
             shift
             while [[ $# -gt 0 ]]; do POSITIONAL+=("$1"); shift; done
@@ -714,6 +1017,7 @@ OPEN_BROWSER_UPLOAD_LIVE="$CFG_OPEN_BROWSER_UPLOAD_LIVE"
 OPEN_BROWSER_UPLOAD_BATCH="$CFG_OPEN_BROWSER_UPLOAD_BATCH"
 ALLOW_LARGE_UPLOADS="$CFG_ALLOW_LARGE_UPLOADS"
 NOTIFY="$CFG_NOTIFY"
+BEHAVIOR="$CFG_BEHAVIOR"
 SKIP_PROMPTS="$CFG_SKIP_PROMPTS"
 
 if [[ "$WRITE_CONFIG_MODE" == "true" ]]; then
@@ -739,6 +1043,7 @@ fi
 # CLI flags always win over both config and prompts.
 [[ -n "$CLI_ALLOW_LARGE" ]] && ALLOW_LARGE_UPLOADS="$CLI_ALLOW_LARGE"
 [[ -n "$CLI_NOTIFY" ]] && NOTIFY="$CLI_NOTIFY"
+[[ -n "$CLI_BEHAVIOR" ]] && BEHAVIOR="$CLI_BEHAVIOR"
 
 # ----------------------------- Gather files ---------------------------------
 

@@ -20,4 +20,4 @@ Tweaks for linux
 
 [HyperHeadset](https://github.com/alphaxleonidas/HyperHeadset)
 
-[File Manager Tweaks](https://github.com/alphaxleonidas/fiile-manager-tweaks)
+[File Manager Tweaks](https://github.com/alphaxleonidas/file-manager-tweaks)
